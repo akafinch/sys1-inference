@@ -1,0 +1,182 @@
+#cloud-config
+# How a bare Akamai GPU instance becomes this demo's inference host.
+#
+# Terraform renders this file into the instance's user data (build/infra/main.tf), and cloud-init
+# runs it on the first boot [https://techdocs.akamai.com/cloud-computing/docs/add-user-data-when-deploying-a-compute-instance, as-of 2026-10-02].
+# The stock image has no NVIDIA driver and no CUDA, so the first boot installs the driver and
+# reboots once to load it. The OpenJev images bring their own CUDA 13.
+#
+#   packages     tools from Ubuntu's main component
+#   write_files  the settings, the bring-up service, a wait for apt's lock
+#   runcmd       the NVIDIA driver, Docker Engine, the NVIDIA Container Toolkit, this repository
+#   power_state  the reboot, only if runcmd finished
+#
+# After the reboot, and after every later boot, sys1-bringup.service runs src/deploy/bringup.sh:
+# the weights, OpenJev's three containers and the app's, and one question to each model. Both
+# halves print "<UTC time> sys1: <phase>" lines into /var/log/cloud-init-output.log, the file
+# Terraform's bringup_command output follows.
+#
+# Terraform fills in the nine variables main.tf passes (repo_url, repo_ref, app_port,
+# openjev_version, the two checkpoints and their revisions, nvidia_driver_branch). A literal
+# dollar-brace in this file would need its dollar doubled
+# [https://developer.hashicorp.com/terraform/language/expressions/strings#escape-sequences]; there
+# is none, because the shell logic lives in bringup.sh and update.sh.
+
+# Refresh the package lists and add these tools before runcmd. No full upgrade: the first boot
+# installs only what the demo needs.
+package_update: true
+package_upgrade: false
+packages:
+  - build-essential # DKMS compiles the driver's kernel module with it
+  - ca-certificates
+  - curl
+  - git # clones this repository
+  - gnupg
+  - jq # bringup.sh reads the app's JSON with it
+
+write_files:
+  # The settings, from Terraform's variables. sys1-bringup.service reads them, and every
+  # docker compose call passes them with --env-file. No secrets: OpenJev runs without a key and
+  # both checkpoints are public.
+  - path: /etc/sys1.env
+    permissions: '0644'
+    content: |
+      # Written by cloud-init from Terraform's variables.
+      APP_PORT=${app_port}
+      OPENJEV_VERSION=${openjev_version}
+      DIFFUSIONGEMMA_MODEL=${diffusiongemma_model}
+      DIFFUSIONGEMMA_REVISION=${diffusiongemma_revision}
+      LAYA_MODEL=${laya_model}
+      LAYA_REVISION=${laya_revision}
+
+  # Brings the stack up on every boot, so it also comes back after any restart. A oneshot is done
+  # when bringup.sh exits; it gets no start timeout, as the first run downloads tens of GB
+  # [TimeoutStartSec=, https://www.freedesktop.org/software/systemd/man/255/systemd.service.html].
+  # Its output joins cloud-init's log, so one tail -F follows both boots. bash runs the script, so
+  # its file mode does not matter.
+  - path: /etc/systemd/system/sys1-bringup.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Bring up the System 1 demo: weights, OpenJev, the app
+      After=docker.service network-online.target
+      Wants=network-online.target
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      TimeoutStartSec=infinity
+      EnvironmentFile=/etc/sys1.env
+      ExecStart=/bin/bash /opt/sys1/src/deploy/bringup.sh
+      StandardOutput=append:/var/log/cloud-init-output.log
+      StandardError=append:/var/log/cloud-init-output.log
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # apt-get gives up at once if another apt process holds the dpkg lock, as the first boot's
+  # automatic updates can; wait up to ten minutes instead. apt-get's own default is 0
+  # [DPkg::Lock::Timeout: doc/examples/configure-index and apt-pkg/deb/debsystem.cc in apt 2.8.3,
+  # https://salsa.debian.org/apt-team/apt, as-of 2026-10-02].
+  - path: /etc/apt/apt.conf.d/90sys1-lock-timeout
+    permissions: '0644'
+    content: |
+      DPkg::Lock::Timeout "600";
+
+# cloud-init writes these items, in order, into ONE /bin/sh script, which by default runs on past
+# a failed command [Runcmd, https://docs.cloud-init.io/en/26.1/reference/modules.html]. set -eu
+# stops it at the first error, the trap names the phase it stopped in, and power_state below
+# then leaves the host up, unrebooted, with the error at the end of the log.
+runcmd:
+  - set -eu
+  - export DEBIAN_FRONTEND=noninteractive
+  - |
+    phase=start
+    say() { phase="$*"; echo "$(date -u +%FT%TZ) sys1: $*"; }
+    stopped() { [ "$1" -eq 0 ] || echo "$(date -u +%FT%TZ) sys1: bootstrap FAILED (exit $1) during: $phase. No reboot; the error is above."; }
+    trap 'stopped $?' EXIT
+
+  # The NVIDIA driver, as NVIDIA's guide installs it on Ubuntu, from NVIDIA's own repository
+  # [https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/ubuntu.html, as-of 2026-10-02].
+  # Every apt-get below is its own transaction, and the order matters.
+  - say "install the NVIDIA driver, branch ${nvidia_driver_branch}"
+  # Headers for the running kernel, which DKMS builds the module against (the guide's
+  # preparation), and linux-headers-generic in case a kernel update lands before the reboot.
+  # pahole comes from Ubuntu's universe component; NVIDIA's dkms depends on it.
+  - apt-get install -y software-properties-common
+  - add-apt-repository -y universe
+  - apt-get install -y "linux-headers-$(uname -r)" linux-headers-generic pahole
+  # NVIDIA's repository for Ubuntu 24.04, trusted through its keyring package.
+  - curl -fsSL -o /run/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+  - dpkg -i /run/cuda-keyring.deb
+  - apt-get update
+  # The branch pin first, on its own: installed in one transaction with the driver, apt resolves
+  # the newest branch instead. The images' CUDA 13 needs branch 580 or newer
+  # [https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/, as-of 2026-10-02].
+  - apt-get install -y nvidia-driver-pinning-${nvidia_driver_branch}
+  # The open kernel modules, the only ones Blackwell supports
+  # [https://developer.nvidia.com/blog/nvidia-transitions-fully-towards-open-source-gpu-kernel-modules/].
+  # They bring nvidia-smi (libnvidia-compute) and blacklist nouveau (nvidia-kernel-common).
+  - apt-get install -y nvidia-open
+
+  # Docker Engine and Compose from Docker's apt repository, as Docker's guide sets it up
+  # [https://docs.docker.com/engine/install/ubuntu/, as-of 2026-10-02]. The release is written
+  # out, noble, since the image is Ubuntu 24.04.
+  - say "install Docker Engine"
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - |
+    cat > /etc/apt/sources.list.d/docker.sources <<'EOF'
+    Types: deb
+    URIs: https://download.docker.com/linux/ubuntu
+    Suites: noble
+    Components: stable
+    Architectures: amd64
+    Signed-By: /etc/apt/keyrings/docker.asc
+    EOF
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # The NVIDIA Container Toolkit, which hands the GPU to a container, pinned as NVIDIA's guide
+  # pins it [https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/1.20.1/install-guide.html].
+  # NVIDIA's CUDA repository, added above for the driver, carries these packages too, so the
+  # toolkit's own repository is not added [its index, as-of 2026-10-02:
+  # https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/].
+  - say "install the NVIDIA Container Toolkit"
+  - NVIDIA_CONTAINER_TOOLKIT_VERSION=1.20.1-1
+  - |
+    apt-get install -y \
+      nvidia-container-toolkit=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+      nvidia-container-toolkit-base=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+      libnvidia-container-tools=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+      libnvidia-container1=$NVIDIA_CONTAINER_TOOLKIT_VERSION
+  - nvidia-ctk runtime configure --runtime=docker
+  - systemctl restart docker
+
+  # This repository, at the ref Terraform names: the host builds the app's image from it, so
+  # whatever that ref holds is what runs. Then the bring-up service, for the next boot.
+  - say "clone ${repo_url} at ${repo_ref}"
+  - git clone "${repo_url}" /opt/sys1
+  - git -C /opt/sys1 checkout --quiet "${repo_ref}"
+  - git -C /opt/sys1 log -1 --oneline
+  - systemctl enable sys1-bringup.service
+  # Last: the mark that every step above succeeded, which power_state checks.
+  - mkdir -p /var/lib/sys1
+  - touch /var/lib/sys1/installed
+  - say "installed, rebooting to load the driver"
+
+# The one reboot, after cloud-init has finished, and only if runcmd reached its end
+# [Power State Change, https://docs.cloud-init.io/en/26.1/reference/modules.html]. A reboot from
+# inside the guest relies on Lassie, Akamai's shutdown watchdog, to boot the host back up
+# [https://github.com/linode/docs/blob/develop/docs/guides/tools-reference/basics/restart-linux-server-from-the-command-line/index.md].
+# ASSUMPTION (unverified): that Lassie does so for this one-card Blackwell plan; Akamai notes it
+# may not reboot Blackwell instances after a shutdown, mostly multi-GPU ones
+# [https://techdocs.akamai.com/cloud-computing/docs/known-limitations-you-may-encounter-with-nvidia-rtx-pro-6000-blackwell-server-edition-gpu-linodes, as-of 2026-10-02].
+# If the host stays off, boot it from Cloud Manager: sys1-bringup.service carries on.
+power_state:
+  mode: reboot
+  message: sys1 bootstrap installed, rebooting to load the NVIDIA driver
+  timeout: 300 # seconds to wait for cloud-init to finish before rebooting anyway
+  condition: test -f /var/lib/sys1/installed

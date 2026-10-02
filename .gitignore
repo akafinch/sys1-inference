@@ -26,3 +26,10 @@
 /deck/
 # Saved session transcripts.
 /chat.log
+
+# The application's build and tool output.
+node_modules/
+src/web/dist/
+.venv/
+__pycache__/
+.pytest_cache/

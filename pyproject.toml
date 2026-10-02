@@ -1,0 +1,21 @@
+[project]
+name = "sys1-inference"
+version = "0.1.0"
+description = "Ask open System 1 models typed questions through OpenJev, on an Akamai GPU."
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.142.2,<0.143",
+    "uvicorn[standard]>=0.54,<0.55",
+    "httpx>=0.28.1,<0.29",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "httpx2>=2.13",
+    "pyyaml>=6.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+pythonpath = ["src"]

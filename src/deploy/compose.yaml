@@ -1,0 +1,100 @@
+# The demo's four containers on the GPU host. bringup.sh and update.sh run it as
+#   docker compose --env-file /etc/sys1.env -f /opt/sys1/src/deploy/compose.yaml <command>
+# /etc/sys1.env, written at first boot from Terraform's variables, sets each variable below; one
+# that is missing stops compose with the message after its :?
+# [https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/, as-of 2026-10-02].
+#
+# Only the app publishes a port. The model servers are reachable on the stack's own network, by
+# service name, from the app; nothing off the host can reach them.
+name: sys1
+
+services:
+  # DiffusionGemma, served by vLLM inside OpenJev's image, behind OpenJev's API on :8080. It also
+  # answers for Laya's model id, laya-1.0, by passing those requests on to laya-gpu.
+  openjev:
+    image: razorback16/openjev:${OPENJEV_VERSION:?set it in /etc/sys1.env}
+    environment:
+      OPENJEV_MODEL: /models/dgemma # the weights bringup.sh downloaded, at their pinned revision
+      OPENJEV_MODEL_ROUTES: laya-1.0=http://laya-gpu:8080
+      # vLLM's share of the card's memory, OpenJev's default, stated. Laya's 2.5 GB fits in the
+      # 10% left, and vLLM's start-up check (that much memory free) passes whichever starts first.
+      OPENJEV_GPU_UTIL: "0.9"
+    volumes:
+      - /opt/models:/models:ro
+      # Kernels compiled on the first start (FlashInfer's take minutes), kept for later starts.
+      - vllm-cache:/root/.cache/vllm
+      - flashinfer-cache:/root/.cache/flashinfer
+    ipc: host # shared memory for vLLM, as in OpenJev's own compose file
+    deploy:
+      resources:
+        reservations:
+          # The GPU, through the NVIDIA Container Toolkit [https://docs.docker.com/compose/how-tos/gpu-support/].
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    # The image's own check, with a longer start period: the first start loads 19 GB of weights
+    # and compiles kernels, and a container still failing it after the start period turns
+    # unhealthy, which stops `up --wait` at once. ASSUMPTION (unverified): that the first start
+    # fits in 1800 s on this host.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 1800s
+    # The container exits when vLLM or the API exits (OpenJev's docker/entrypoint.sh); come back.
+    restart: unless-stopped
+
+  # Laya's typed-decisions checkpoint on the GPU: openjev sends it every laya-1.0 request.
+  laya-gpu:
+    image: razorback16/openjev-laya:${OPENJEV_VERSION:?set it in /etc/sys1.env}
+    environment:
+      OPENJEV_LAYA_MODEL: /models/laya
+      OPENJEV_DEVICE: cuda
+      # As OpenJev's own compose file runs its encoders beside vLLM: PyTorch grows one segment in
+      # place instead of fragmenting the 10% of the card that vLLM leaves
+      # [https://github.com/razorback16/openjev docker-compose.yml; expandable_segments,
+      # https://docs.pytorch.org/docs/stable/notes/cuda.html, as-of 2026-10-02].
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - /opt/models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    # After a GPU out-of-memory error Laya exits on purpose, so that a restart puts it back on
+    # the GPU rather than leaving it on the CPU (openjev/encoders.py in OpenJev 0.5.1).
+    restart: unless-stopped
+
+  # The same checkpoint on the host's CPU, at its own address. A Laya server answers only to
+  # laya-1.0, so the app tells the two copies apart by address, not by model id.
+  laya-cpu:
+    image: razorback16/openjev-laya:${OPENJEV_VERSION:?set it in /etc/sys1.env}
+    environment:
+      OPENJEV_LAYA_MODEL: /models/laya
+      OPENJEV_DEVICE: cpu
+    volumes:
+      - /opt/models:/models:ro
+    restart: unless-stopped
+
+  # The page and its API, built on this host from this repository by app.Dockerfile.
+  app:
+    build:
+      context: ../.. # the repository root
+      dockerfile: src/deploy/app.Dockerfile
+    environment:
+      OPENJEV_URL: http://openjev:8080 # DiffusionGemma, and Laya on the GPU
+      OPENJEV_LAYA_CPU_URL: http://laya-cpu:8080
+      APP_PORT: ${APP_PORT:?set it in /etc/sys1.env}
+    # The one published port, on every interface: the Cloud Firewall in front of the host admits
+    # only the allowed range, to this port and to SSH.
+    ports:
+      - "0.0.0.0:${APP_PORT:?set it in /etc/sys1.env}:${APP_PORT:?set it in /etc/sys1.env}"
+    # Started once all three model servers report healthy, so its first question finds them up.
+    depends_on:
+      openjev: {condition: service_healthy}
+      laya-gpu: {condition: service_healthy}
+      laya-cpu: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  vllm-cache:
+  flashinfer-cache:

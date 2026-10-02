@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (ignored by git) and fill in. Export LINODE_TOKEN before plan/apply.
+region         = "us-sea"
+plan           = "g3-gpu-rtxpro6000-blackwell-1"
+ssh_public_key = "ssh-ed25519 AAAA... you@example"
+allowed_cidrs  = ["203.0.113.7/32"] # your browser's public address; a VPN changes it
+repo_url       = "https://github.com/<owner>/<repo>.git"
+repo_ref       = "main"
+# app_port             = 80
+# nvidia_driver_branch = "595"
